@@ -1,0 +1,384 @@
+# © 2025 Amazon Web Services, Inc. All Rights Reserved.
+# This AWS content is subject to the terms of the ______
+# Contract No. _______
+
+default:
+  image: alpine
+  interruptible: true
+
+variables:
+  CONTAINER_REGISTRY: registry.code.aws.dev
+  CONTAINER_IMAGE_NAME: ${CONTAINER_REGISTRY}/proserve/automated-security-helper/automated-security-helper
+  ASH_IMAGE_TAG: "latest"
+  # Large t-shirt size
+  KUBERNETES_CPU_REQUEST: "8"
+  KUBERNETES_CPU_LIMIT: "8"
+  KUBERNETES_MEMORY_REQUEST: "16Gi"
+  KUBERNETES_MEMORY_LIMIT: "16Gi"
+  KUBERNETES_EPHEMERAL_STORAGE_REQUEST: "16Gi"
+  KUBERNETES_EPHEMERAL_STORAGE_LIMIT: "16Gi"
+
+stages:
+  - Security
+pre-commit:
+  stage: Security
+  variables:
+    PRE_COMMIT_HOME: ${CI_PROJECT_DIR}/.cache/pre-commit
+    PYTHONPATH: ${CI_PROJECT_DIR}
+  cache:
+    key: pre-commit-${CI_COMMIT_REF_SLUG}
+    paths:
+      - ${PRE_COMMIT_HOME}
+      - .venv/
+  script:
+    - |
+      apk add --no-cache build-base python3 py3-pip nodejs npm git bash gcc python3-dev musl-dev ruby ruby-dev linux-headers py3-numpy python3-tkinter curl libxml2-dev libxslt-dev xmlsec-dev
+      gem install json
+      python3 -m venv .venv && source .venv/bin/activate
+      pip install --upgrade pip wheel setuptools pre-commit black flake8 mypy safety detect-secrets codespell pyupgrade
+      npm install -g aws-cdk prettier@4.0.0-alpha.8
+      if [ -f "requirements.txt" ]; then
+        pip install -r requirements.txt || echo "Warning: Failed to install some requirements"
+      fi
+      echo "Debug: Checking for .prettierrc.json"
+      ls -la .prettierrc.json || echo ".prettierrc.json not found"
+      echo "Debug: Current prettier version:"
+      prettier --version
+      echo "Debug: Current directory contents:"
+      ls -la
+      echo "Debug: Running pre-commit with verbose output"
+      SKIP=no-commit-to-branch pre-commit run prettier --verbose --all-files || echo "Prettier failed but continuing"
+      SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure || exit 1
+      if command -v cdk &>/dev/null; then
+        cdk ls || echo "Warning: CDK list failed but continuing"
+      fi
+  rules:
+    - if: "$CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_IID"
+      when: always
+
+find-and-build-containers:
+  image:
+    name: registry.code.aws.dev/proserve/components/kaniko/executor:latest
+    entrypoint: [""]
+  stage: Security
+  needs: []
+  retry: 1
+  script:
+    - |
+      # Find all Dockerfile variations: Dockerfile, *.Dockerfile, *.dockerfile, Dockerfile.*
+      DOCKERFILES=$(find ${CI_PROJECT_DIR} \( -name "Dockerfile" -o -name "*.Dockerfile" -o -name "*.dockerfile" -o -name "Dockerfile.*" \) -type f | sort)
+      if [ -z "$DOCKERFILES" ]; then
+          mkdir -p ${CI_PROJECT_DIR}/container-artifacts
+          echo "No Dockerfiles found" > ${CI_PROJECT_DIR}/container-artifacts/no_dockerfiles.txt
+          exit 0
+      fi
+      mkdir -p ${CI_PROJECT_DIR}/container-artifacts
+      for DOCKERFILE in $DOCKERFILES; do
+          CONTEXT_DIR=$(dirname "$DOCKERFILE")
+          SAFE_NAME=$(echo "${CONTEXT_DIR#"$CI_PROJECT_DIR/"}" | sed 's/[^a-zA-Z0-9]/_/g')
+          echo "Building: ${CONTEXT_DIR#"$CI_PROJECT_DIR/"}"
+          /kaniko/executor \
+              --context "$CONTEXT_DIR" \
+              --dockerfile "$DOCKERFILE" \
+              --no-push \
+              --tar-path ${CI_PROJECT_DIR}/container-artifacts/${SAFE_NAME}.tar \
+              --build-arg BUILD_DATE="$(date -u +'%Y-%m-%d')" \
+              --build-arg BUILD_VERSION="${CI_COMMIT_REF_NAME}" \
+              --compressed-caching=true || { echo "Failed to build ${CONTEXT_DIR#"$CI_PROJECT_DIR/"}"; continue; }
+          echo "${CONTEXT_DIR#"$CI_PROJECT_DIR/"}" > ${CI_PROJECT_DIR}/container-artifacts/${SAFE_NAME}.path
+      done
+      if [ ! -f ${CI_PROJECT_DIR}/container-artifacts/*.tar ]; then
+          echo "Warning: No containers were successfully built"
+      fi
+  artifacts:
+    paths:
+      - container-artifacts/
+    expire_in: 1 month
+  rules:
+    - if: "$CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_IID"
+      when: always
+
+scan-containers:
+  stage: Security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs:
+    - find-and-build-containers
+  script:
+    - |
+      if [ ! -d "${CI_PROJECT_DIR}/container-artifacts" ] || [ -z "$(ls -A ${CI_PROJECT_DIR}/container-artifacts/*.tar 2>/dev/null)" ]; then
+          [ -f "${CI_PROJECT_DIR}/container-artifacts/no_dockerfiles.txt" ] && echo "No Dockerfiles found." || echo "No container artifacts found."
+          exit 0
+      fi
+      mkdir -p ${CI_PROJECT_DIR}/container-scan-results
+      FOUND_VULNERABILITIES=0
+      for TAR_FILE in ${CI_PROJECT_DIR}/container-artifacts/*.tar; do
+          BASE_NAME=$(basename "$TAR_FILE" .tar)
+          ORIGINAL_PATH=$(cat "${CI_PROJECT_DIR}/container-artifacts/${BASE_NAME}.path" 2>/dev/null || echo "$BASE_NAME")
+          echo "Scanning: $ORIGINAL_PATH"
+          trivy image --severity HIGH,CRITICAL --no-progress --input "$TAR_FILE" --ignore-unfixed || echo "Warning: Trivy scan failed for $ORIGINAL_PATH"
+          trivy image --severity HIGH,CRITICAL --format json --no-progress --output "${CI_PROJECT_DIR}/container-scan-results/${BASE_NAME}.json" --input "$TAR_FILE" --ignore-unfixed || echo "Warning: Trivy JSON output failed for $ORIGINAL_PATH"
+          if [ -f "${CI_PROJECT_DIR}/container-scan-results/${BASE_NAME}.json" ] && grep -q '"Vulnerabilities": \[' "${CI_PROJECT_DIR}/container-scan-results/${BASE_NAME}.json"; then
+              echo "FAIL: Found security vulnerabilities in $ORIGINAL_PATH"
+              FOUND_VULNERABILITIES=1
+          fi
+      done
+      exit $FOUND_VULNERABILITIES
+  artifacts:
+    paths:
+      - container-scan-results/
+    when: always
+    expire_in: 1 month
+  rules:
+    - if: "$CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_IID"
+      when: always
+
+run-ash-scan:
+  image:
+    name: ${CONTAINER_IMAGE_NAME}:${ASH_IMAGE_TAG}
+  stage: Security
+  needs: []
+  retry: 1
+  variables:
+    # X-Large t-shirt size
+    KUBERNETES_CPU_REQUEST: "8"
+    KUBERNETES_CPU_LIMIT: "8"
+    KUBERNETES_MEMORY_REQUEST: "16Gi"
+    KUBERNETES_MEMORY_LIMIT: "16Gi"
+    KUBERNETES_EPHEMERAL_STORAGE_REQUEST: "16Gi"
+    KUBERNETES_EPHEMERAL_STORAGE_LIMIT: "16Gi"
+  script:
+    - ash --verbose
+    - ash report
+  artifacts:
+    paths:
+      - .ash/ash_output
+    when: always
+    reports:
+      junit: .ash/ash_output/reports/ash.junit.xml
+      cyclonedx: .ash/ash_output/reports/ash.cdx.json
+      sast: .ash/ash_output/reports/ash.gl-sast-report.json
+    expire_in: 1 month
+  rules:
+    - if: "$CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_IID"
+      when: always
+
+# Custom PowerShell analysis job with detailed output and formatting
+powershell-analysis:
+  stage: Security
+  needs: []
+  # LTS version for stability and consistent behavior across runners
+  image: mcr.microsoft.com/powershell:lts-ubuntu-20.04
+  before_script:
+    # Show PowerShell version for debugging purposes
+    - pwsh -Command 'Write-Host "PowerShell Version:" -NoNewline; $PSVersionTable.PSVersion'
+    # Trust PSGallery to avoid prompts during module installation
+    - pwsh -Command 'Set-PSRepository -Name PSGallery -InstallationPolicy Trusted'
+    # Install latest PSScriptAnalyzer - the Swiss Army knife for PS linting
+    - pwsh -Command 'Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck'
+  script:
+    - |
+      # Write the analyzer script to a file to avoid YAML escaping hell
+      cat > analyzer.ps1 << 'EOL'
+      $ErrorActionPreference = "Stop"
+
+      # Find PowerShell files but skip our analyzer script (we don't want to analyze ourselves)
+      Write-Host "Checking for PowerShell files..."
+      $psFiles = Get-ChildItem -Path . -Filter "*.ps1" -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -ne (Join-Path (Get-Location) "analyzer.ps1") }
+
+      # Bail early if no PS files found - no point in continuing
+      if ($psFiles.Count -eq 0) {
+        Write-Host "No PowerShell files found to analyze."
+        "No PowerShell files found to analyze" | Out-File -FilePath "PSScriptAnalyzer-results.txt"
+        exit 0
+      }
+
+      # Set up formatting rules - these match the team's agreed coding style
+      # Consistency is king - these settings enforce our standards
+      $formattingSettings = @{
+        IncludeRules = @("PSPlaceOpenBrace", "PSUseConsistentIndentation", "PSUseConsistentWhitespace")
+        Rules = @{
+          PSPlaceOpenBrace = @{
+            Enable = $true
+            OnSameLine = $true      # Opening brace on same line as statement
+            NewLineAfter = $true     # New line after opening brace
+          }
+          PSUseConsistentIndentation = @{
+            Enable = $true
+            IndentationSize = 4      # 4 spaces, not tabs!
+            Kind = "space"
+          }
+          PSUseConsistentWhitespace = @{
+            Enable = $true
+            CheckOpenBrace = $true   # Space before opening braces
+            CheckOpenParen = $true   # Space before opening parenthesis
+            CheckOperator = $true    # Spaces around operators
+            CheckSeparator = $true   # Space after commas
+          }
+        }
+      }
+
+      # Format all PowerShell files - fix what we can automatically
+      Write-Host "==== FORMATTING POWERSHELL FILES ====" -ForegroundColor Cyan
+      $formatResults = @()
+      $formattedCount = 0
+      $unchangedCount = 0
+      $errorCount = 0
+
+      foreach ($file in $psFiles) {
+        try {
+          Write-Host "Formatting: $($file.FullName)"
+          $content = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
+          $formatted = Invoke-Formatter -ScriptDefinition $content -Settings $formattingSettings -ErrorAction Stop
+
+          # Only write the file if we actually changed something
+          if ($formatted -ne $content) {
+            $formatted | Out-File -FilePath $file.FullName -Force -Encoding utf8 -ErrorAction Stop
+            $formatResults += [PSCustomObject]@{
+              File = $file.FullName
+              Status = "Formatted"
+            }
+            $formattedCount++
+          } else {
+            $formatResults += [PSCustomObject]@{
+              File = $file.FullName
+              Status = "No changes needed"
+            }
+            $unchangedCount++
+          }
+        } catch {
+          # Track formatting errors but don't fail the build for them
+          $formatResults += [PSCustomObject]@{
+            File = $file.FullName
+            Status = "Error: $($_.Exception.Message)"
+          }
+          $errorCount++
+        }
+      }
+
+      # Save formatting results for the pipeline artifacts
+      $formatResults | ConvertTo-Json -Depth 3 | Out-File -FilePath "PSFormatter-results.json" -Encoding utf8
+
+      # Now run the deeper analysis to catch issues formatting can't fix
+      Write-Host "==== ANALYZING POWERSHELL FILES ====" -ForegroundColor Cyan
+      # Filter out our analyzer script from results - we don't care about its issues
+      $results = Invoke-ScriptAnalyzer -Path . -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.ScriptPath -ne (Join-Path (Get-Location) "analyzer.ps1") }
+
+      if ($null -ne $results -and $results.Count -gt 0) {
+        # Export results in multiple formats for different tools to consume
+        $results | Export-Clixml -Path "PSScriptAnalyzer-results.xml"
+        $results | ConvertTo-Json -Depth 3 | Out-File -FilePath "PSScriptAnalyzer-results.json"
+
+        # Fail the job if issues found - this is what makes the pipeline enforce standards
+        Write-Host "Found $($results.Count) issues in PowerShell files" -ForegroundColor Red
+        exit 1
+      } else {
+        # All good! No issues found
+        Write-Host "No PowerShell issues found." -ForegroundColor Green
+        "No PowerShell issues found" | Out-File -FilePath "PSScriptAnalyzer-results.txt"
+      }
+      EOL
+    - pwsh -File analyzer.ps1
+  artifacts:
+    when: always
+    paths:
+      - PSScriptAnalyzer-results.*
+      - PSFormatter-results.json
+    expire_in: 1 month
+  rules:
+    - if: "$CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_IID"
+      when: always
+
+# Open Source license review for Python projects
+Python-licenses:
+  stage: Security
+  needs: []
+  image: python:3.9-slim
+  script:
+    - |
+      # Install tools needed for license checking
+      echo "Installing license checking tools..."
+      pip3 install pipreqs pip-licenses
+
+      # First, look for existing requirements.txt files in the codebase
+      echo "Searching for requirements.txt files..."
+      REQUIREMENTS_FILES=$(find . -name "requirements.txt" | sort)
+
+      if [ -z "$REQUIREMENTS_FILES" ]; then
+        echo "No requirements.txt found. Attempting to generate one from project imports..."
+        if ls *.py 2>/dev/null || find . -name "*.py" | grep -q .; then
+          pipreqs . --force --ignore .venv,venv,env,.env,node_modules 2>/dev/null || echo "Could not generate requirements.txt"
+          if [ -f "requirements.txt" ]; then
+            REQUIREMENTS_FILES="requirements.txt"
+          fi
+        else
+          echo "No Python files found."
+        fi
+      else
+        echo "Found existing requirements.txt files:"
+        echo "$REQUIREMENTS_FILES"
+      fi
+
+      # Create a directory for license reports
+      mkdir -p license-reports
+
+      # Process each requirements file
+      if [ -n "$REQUIREMENTS_FILES" ]; then
+        for REQ_FILE in $REQUIREMENTS_FILES; do
+          echo "Processing $REQ_FILE..."
+
+          # Get directory name for organizing outputs
+          DIR_NAME=$(dirname "$REQ_FILE" | sed 's/^\.\///' | sed 's/\//_/g')
+          if [ "$DIR_NAME" = "." ]; then
+            DIR_NAME="root"
+          fi
+
+          # Install dependencies from this requirements file
+          echo "Installing dependencies from $REQ_FILE..."
+          pip3 install -r "$REQ_FILE" || echo "Warning: Some packages could not be installed"
+
+          # Generate license reports in different formats
+          echo "Generating license reports for $REQ_FILE..."
+          pip-licenses --format=markdown > "license-reports/python-${DIR_NAME}-licenses.md" || echo "Warning: Could not generate license report"
+          pip-licenses --format=csv > "license-reports/python-${DIR_NAME}-licenses.csv" || echo "Warning: Could not generate CSV report"
+          pip-licenses --format=json > "license-reports/python-${DIR_NAME}-licenses.json" || echo "Warning: Could not generate JSON report"
+
+          # Display the licenses found
+          echo "Found the following Python licenses for $REQ_FILE:"
+          cat "license-reports/python-${DIR_NAME}-licenses.md" || echo "No licenses found"
+          echo "----------------------------------------"
+        done
+      else
+        echo "No Python dependencies to analyze."
+      fi
+
+      # Create a summary file
+      echo "# License Summary Report" > license-reports/summary.md
+      echo "Generated on: $(date)" >> license-reports/summary.md
+      echo "" >> license-reports/summary.md
+
+      echo "## Python Dependencies" >> license-reports/summary.md
+      if [ -n "$REQUIREMENTS_FILES" ]; then
+        echo "Found $(echo "$REQUIREMENTS_FILES" | wc -l) requirements.txt files" >> license-reports/summary.md
+        for file in license-reports/python-*-licenses.md; do
+          if [ -f "$file" ]; then
+            echo "- [$(basename "$file" | sed 's/python-\(.*\)-licenses.md/\1/')]($(basename "$file"))" >> license-reports/summary.md
+          fi
+        done
+      else
+        echo "No Python dependencies found." >> license-reports/summary.md
+      fi
+
+      echo "License reports generated successfully. Review the artifacts for details."
+  artifacts:
+    paths:
+      - "**/requirements.txt"
+      - "license-reports/"
+    expire_in: 1 month
+    when: always
+  rules:
+    - if: "$CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_IID"
+      when: always

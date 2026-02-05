@@ -1,0 +1,522 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Ephemeral Data Collaboration Rooms - Automated time-bound secure data sharing infrastructure'
+
+Parameters:
+  CollaborationBucketName:
+    Type: String
+    Description: Name for the S3 bucket hosting collaboration rooms
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name
+  
+  DefaultRoomLifetimeHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: Default lifetime for collaboration rooms in hours (1-168)
+  
+  MaxCredentialDurationHours:
+    Type: Number
+    Default: 12
+    MinValue: 1
+    MaxValue: 12
+    Description: Maximum duration for STS temporary credentials in hours
+
+Resources:
+  # S3 Bucket for Collaboration Rooms
+  CollaborationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CollaborationBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      ObjectLockEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteExpiredRooms
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpirationInDays: 1
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AuditLogBucket
+        LogFilePrefix: collaboration-access-logs/
+      Tags:
+        - Key: Purpose
+          Value: EphemeralCollaboration
+
+  # Audit Log Bucket
+  AuditLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${CollaborationBucketName}-audit-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      ObjectLockEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: RetainAuditLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # DynamoDB Table for Room Metadata
+  RoomMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CollaborationRoomMetadata
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: RoomId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: RoomId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ExpirationTime
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Purpose
+          Value: RoomTracking
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CollaborationRoomManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt CollaborationBucket.Arn
+                  - !Sub '${CollaborationBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt RoomMetadataTable.Arn
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/CollaborationRoom-*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/CollaborationRoom-*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt CleanupRoomFunction.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/CollaborationRoom-Cleanup-*'
+
+  # Lambda Function: Cleanup Room
+  CleanupRoomFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CleanupCollaborationRoom
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CollaborationBucket
+          TABLE_NAME: !Ref RoomMetadataTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          events = boto3.client('events')
+          
+          def lambda_handler(event, context):
+              try:
+                  room_id = event.get('room_id')
+                  if not room_id:
+                      return {'statusCode': 400, 'body': json.dumps({'error': 'room_id required'})}
+                  
+                  bucket_name = os.environ['BUCKET_NAME']
+                  table_name = os.environ['TABLE_NAME']
+                  
+                  table = dynamodb.Table(table_name)
+                  response = table.get_item(Key={'RoomId': room_id})
+                  
+                  if 'Item' not in response:
+                      return {'statusCode': 404, 'body': json.dumps({'error': 'Room not found'})}
+                  
+                  room_prefix = response['Item']['S3Prefix']
+                  
+                  paginator = s3.get_paginator('list_objects_v2')
+                  pages = paginator.paginate(Bucket=bucket_name, Prefix=room_prefix)
+                  
+                  for page in pages:
+                      if 'Contents' in page:
+                          objects = [{'Key': obj['Key']} for obj in page['Contents']]
+                          s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+                  
+                  table.update_item(
+                      Key={'RoomId': room_id},
+                      UpdateExpression='SET #status = :status',
+                      ExpressionAttributeNames={'#status': 'Status'},
+                      ExpressionAttributeValues={':status': 'Deleted'}
+                  )
+                  
+                  # Delete IAM role created for this room
+                  iam = boto3.client('iam')
+                  role_name = f'CollaborationRoom-{room_id[:8]}'
+                  try:
+                      iam.delete_role_policy(RoleName=role_name, PolicyName='RoomAccessPolicy')
+                      iam.delete_role(RoleName=role_name)
+                  except iam.exceptions.NoSuchEntityException:
+                      print(f'IAM role {role_name} not found, skipping')
+                  except Exception as e:
+                      print(f'Error deleting IAM role: {str(e)}')
+                  
+                  rule_name = f'CollaborationRoom-Cleanup-{room_id}'
+                  try:
+                      events.remove_targets(Rule=rule_name, Ids=['1'])
+                      events.delete_rule(Name=rule_name)
+                  except events.exceptions.ResourceNotFoundException:
+                      print(f'EventBridge rule {rule_name} not found, skipping')
+                  except Exception as e:
+                      print(f'Error removing EventBridge rule: {str(e)}')
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': f'Room {room_id} cleaned up successfully'})
+                  }
+              except Exception as e:
+                  print(f'Cleanup error: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+  # Lambda Function: Create Room
+  CreateRoomFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateCollaborationRoom
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CollaborationBucket
+          TABLE_NAME: !Ref RoomMetadataTable
+          DEFAULT_LIFETIME_HOURS: !Ref DefaultRoomLifetimeHours
+          MAX_CREDENTIAL_DURATION: !Ref MaxCredentialDurationHours
+          CLEANUP_FUNCTION_ARN: !GetAtt CleanupRoomFunction.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime, timedelta
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          sts = boto3.client('sts')
+          events = boto3.client('events')
+          
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event['body']) if isinstance(event.get('body'), str) else event
+                  
+                  room_id = str(uuid.uuid4())
+                  requester = body.get('requester_email')
+                  lifetime_hours = body.get('lifetime_hours', int(os.environ['DEFAULT_LIFETIME_HOURS']))
+                  description = body.get('description', '')
+                  
+                  # Validate lifetime_hours
+                  max_lifetime = int(os.environ['DEFAULT_LIFETIME_HOURS'])
+                  if lifetime_hours > max_lifetime or lifetime_hours < 1:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': f'lifetime_hours must be between 1 and {max_lifetime}'})
+                      }
+                  
+                  bucket_name = os.environ['BUCKET_NAME']
+                  table_name = os.environ['TABLE_NAME']
+                  
+                  # Create S3 prefix for room
+                  room_prefix = f'rooms/{room_id}/'
+                  s3.put_object(Bucket=bucket_name, Key=room_prefix)
+                  
+                  # Calculate expiration
+                  expiration_time = datetime.utcnow() + timedelta(hours=lifetime_hours)
+                  expiration_epoch = int(expiration_time.timestamp())
+                  
+                  # Store metadata in DynamoDB
+                  table = dynamodb.Table(table_name)
+                  table.put_item(Item={
+                      'RoomId': room_id,
+                      'RequesterEmail': requester,
+                      'CreatedAt': datetime.utcnow().isoformat(),
+                      'ExpirationTime': expiration_epoch,
+                      'LifetimeHours': lifetime_hours,
+                      'Description': description,
+                      'S3Prefix': room_prefix,
+                      'Status': 'Active'
+                  })
+                  
+                  # Generate temporary credentials using AssumeRole
+                  import time
+                  iam = boto3.client('iam')
+                  account_id = sts.get_caller_identity()['Account']
+                  role_name = f'CollaborationRoom-{room_id[:8]}'
+                  
+                  assume_role_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Effect": "Allow",
+                          "Principal": {"Service": "lambda.amazonaws.com"},
+                          "Action": "sts:AssumeRole",
+                          "Condition": {
+                              "StringEquals": {
+                                  "aws:SourceAccount": account_id
+                              }
+                          }
+                      }]
+                  }
+                  
+                  room_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                          "Effect": "Allow",
+                          "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+                          "Resource": [
+                              f"arn:aws:s3:::{bucket_name}/{room_prefix}*",
+                              f"arn:aws:s3:::{bucket_name}"
+                          ]
+                      }]
+                  }
+                  
+                  # Create IAM role for this room
+                  iam.create_role(
+                      RoleName=role_name,
+                      AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                      MaxSessionDuration=43200
+                  )
+                  
+                  # Attach inline policy
+                  iam.put_role_policy(
+                      RoleName=role_name,
+                      PolicyName='RoomAccessPolicy',
+                      PolicyDocument=json.dumps(room_policy)
+                  )
+                  
+                  # Wait for role propagation with retry logic
+                  max_retries = 10
+                  for attempt in range(max_retries):
+                      try:
+                          sts.get_caller_identity()
+                          break
+                      except:
+                          if attempt < max_retries - 1:
+                              time.sleep(1)
+                          else:
+                              raise
+                  
+                  # Assume the role (role chaining limited to 1 hour)
+                  credential_duration = min(lifetime_hours * 3600, int(os.environ['MAX_CREDENTIAL_DURATION']) * 3600, 3600)
+                  role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+                  
+                  credentials = sts.assume_role(
+                      RoleArn=role_arn,
+                      RoleSessionName=f'room-session-{room_id[:8]}',
+                      DurationSeconds=credential_duration
+                  )
+                  
+                  # Schedule cleanup
+                  rule_name = f'CollaborationRoom-Cleanup-{room_id}'
+                  events.put_rule(
+                      Name=rule_name,
+                      ScheduleExpression=f'cron({expiration_time.minute} {expiration_time.hour} {expiration_time.day} {expiration_time.month} ? *)',
+                      State='ENABLED'
+                  )
+                  
+                  events.put_targets(
+                      Rule=rule_name,
+                      Targets=[{
+                          'Id': '1',
+                          'Arn': os.environ.get('CLEANUP_FUNCTION_ARN'),
+                          'Input': json.dumps({'room_id': room_id})
+                      }]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'room_id': room_id,
+                          's3_prefix': room_prefix,
+                          'bucket_name': bucket_name,
+                          'expiration_time': expiration_time.isoformat(),
+                          'credentials': {
+                              'access_key_id': credentials['Credentials']['AccessKeyId'],
+                              'secret_access_key': credentials['Credentials']['SecretAccessKey'],
+                              'session_token': credentials['Credentials']['SessionToken'],
+                              'expiration': credentials['Credentials']['Expiration'].isoformat()
+                          },
+                          'message': 'Store credentials securely. They will not be retrievable later.'
+                      })
+                  }
+              except ValueError as e:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Invalid input'})
+                  }
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+  # Lambda Permission for EventBridge
+  CleanupFunctionEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CleanupRoomFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/CollaborationRoom-Cleanup-*'
+
+  # API Gateway REST API
+  CollaborationAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CollaborationRoomsAPI
+      Description: API for managing ephemeral collaboration rooms
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource
+  RoomsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CollaborationAPI
+      ParentId: !GetAtt CollaborationAPI.RootResourceId
+      PathPart: rooms
+
+  # API Gateway Method: POST /rooms
+  CreateRoomMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CollaborationAPI
+      ResourceId: !Ref RoomsResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateRoomFunction.Arn}/invocations'
+
+  # Lambda Permission for API Gateway
+  CreateRoomFunctionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateRoomFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CollaborationAPI}/*/*'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateRoomMethod
+    Properties:
+      RestApiId: !Ref CollaborationAPI
+      StageName: prod
+
+  # CloudWatch Log Group for API Gateway
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${CollaborationAPI}'
+      RetentionInDays: 30
+
+Outputs:
+  CollaborationBucketName:
+    Description: S3 bucket for collaboration rooms
+    Value: !Ref CollaborationBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${CollaborationAPI}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  RoomMetadataTableName:
+    Description: DynamoDB table for room metadata
+    Value: !Ref RoomMetadataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  CreateRoomFunctionArn:
+    Description: ARN of the Create Room Lambda function
+    Value: !GetAtt CreateRoomFunction.Arn
+
+  CleanupRoomFunctionArn:
+    Description: ARN of the Cleanup Room Lambda function
+    Value: !GetAtt CleanupRoomFunction.Arn
+    
