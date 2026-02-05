@@ -117,6 +117,34 @@ Resources:
               Bool:
                 'aws:SecureTransport': false
 
+  # KMS Key for DynamoDB
+  DynamoDBKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for DynamoDB encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow DynamoDB
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+
   # DynamoDB Table for Room Metadata
   RoomMetadataTable:
     Type: AWS::DynamoDB::Table
@@ -132,6 +160,7 @@ Resources:
       SSESpecification:
         SSEEnabled: true
         SSEType: KMS
+        KMSMasterKeyId: !GetAtt DynamoDBKmsKey.Arn
       TimeToLiveSpecification:
         AttributeName: ExpirationTime
         Enabled: true
@@ -564,6 +593,7 @@ Resources:
     Type: AWS::KMS::Key
     Properties:
       Description: KMS key for CloudWatch Logs encryption
+      EnableKeyRotation: true
       KeyPolicy:
         Version: '2012-10-17'
         Statement:
