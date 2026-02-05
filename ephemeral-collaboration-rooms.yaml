@@ -75,6 +75,47 @@ Resources:
           - Id: RetainAuditLogs
             Status: Enabled
             ExpirationInDays: 90
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AuditLogBucket
+        LogFilePrefix: audit-logs-access/
+
+  # S3 Bucket Policy for Collaboration Bucket
+  CollaborationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CollaborationBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CollaborationBucket.Arn
+              - !Sub '${CollaborationBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # S3 Bucket Policy for Audit Log Bucket
+  AuditLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AuditLogBucket.Arn
+              - !Sub '${AuditLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
 
   # DynamoDB Table for Room Metadata
   RoomMetadataTable:
@@ -88,6 +129,9 @@ Resources:
       KeySchema:
         - AttributeName: RoomId
           KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
       TimeToLiveSpecification:
         AttributeName: ExpirationTime
         Enabled: true
@@ -164,10 +208,11 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: CleanupCollaborationRoom
-      Runtime: python3.9
+      Runtime: python3.13
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 300
+      ReservedConcurrentExecutions: 5
       Environment:
         Variables:
           BUCKET_NAME: !Ref CollaborationBucket
@@ -250,10 +295,11 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: CreateCollaborationRoom
-      Runtime: python3.9
+      Runtime: python3.13
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 60
+      ReservedConcurrentExecutions: 10
       Environment:
         Variables:
           BUCKET_NAME: !Ref CollaborationBucket
@@ -437,6 +483,19 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/CollaborationRoom-Cleanup-*'
 
+  # API Gateway Usage Plan
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: CollaborationRoomsUsagePlan
+      ApiStages:
+        - ApiId: !Ref CollaborationAPI
+          Stage: prod
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+
   # API Gateway REST API
   CollaborationAPI:
     Type: AWS::ApiGateway::RestApi
@@ -485,6 +544,12 @@ Resources:
     Properties:
       RestApiId: !Ref CollaborationAPI
       StageName: prod
+      StageDescription:
+        AccessLogSetting:
+          DestinationArn: !GetAtt ApiLogGroup.Arn
+          Format: '$context.requestId $context.error.message $context.error.messageString'
+        LoggingLevel: INFO
+        MetricsEnabled: true
 
   # CloudWatch Log Group for API Gateway
   ApiLogGroup:
@@ -492,6 +557,37 @@ Resources:
     Properties:
       LogGroupName: !Sub '/aws/apigateway/${CollaborationAPI}'
       RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  # KMS Key for CloudWatch Logs
+  LogsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CloudWatch Logs encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
 
 Outputs:
   CollaborationBucketName:

@@ -101,6 +101,3 @@ Delete the stack:
 - Temporary IAM credentials
 - Automatic cleanup via TTL and EventBridge
 
-## License
-
-MIT
