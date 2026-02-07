@@ -56,6 +56,11 @@ Resources:
   # Audit Log Bucket
   AuditLogBucket:
     Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: CFN_NAG_W35
+            reason: "Audit log bucket is the destination for access logs. Logging the audit bucket itself would create circular dependency and unnecessary storage costs."
     Properties:
       BucketName: !Sub '${CollaborationBucketName}-audit-logs'
       BucketEncryption:
@@ -172,6 +177,11 @@ Resources:
   # IAM Role for Lambda Functions
   LambdaExecutionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: CFN_NAG_W76
+            reason: "IAM policy requires multiple AWS service permissions (S3, DynamoDB, IAM, STS, EventBridge, KMS) for room lifecycle management. SPCM > 25 is acceptable for this orchestration role. Permissions scoped to specific resources with wildcards only for dynamic room IDs."
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
