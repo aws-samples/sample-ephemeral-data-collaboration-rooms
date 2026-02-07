@@ -75,9 +75,6 @@ Resources:
           - Id: RetainAuditLogs
             Status: Enabled
             ExpirationInDays: 90
-      LoggingConfiguration:
-        DestinationBucketName: !Ref AuditLogBucket
-        LogFilePrefix: audit-logs-access/
 
   # S3 Bucket Policy for Collaboration Bucket
   CollaborationBucketPolicy:
@@ -222,22 +219,31 @@ Resources:
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/CollaborationRoom-*'
               - Effect: Allow
                 Action:
-                  - lambda:InvokeFunction
-                Resource: !GetAtt CleanupRoomFunction.Arn
-              - Effect: Allow
-                Action:
                   - events:PutRule
                   - events:PutTargets
                   - events:DeleteRule
                   - events:RemoveTargets
                 Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/CollaborationRoom-Cleanup-*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:CleanupCollaborationRoom'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource:
+                  - !GetAtt DynamoDBKmsKey.Arn
+                  - !GetAtt LogsKmsKey.Arn
 
   # Lambda Function: Cleanup Room
   CleanupRoomFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: CleanupCollaborationRoom
-      Runtime: python3.13
+      Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 300
@@ -290,7 +296,7 @@ Resources:
                   
                   # Delete IAM role created for this room
                   iam = boto3.client('iam')
-                  role_name = f'CollaborationRoom-{room_id[:8]}'
+                  role_name = f'CollaborationRoom-{room_id}'
                   try:
                       iam.delete_role_policy(RoleName=role_name, PolicyName='RoomAccessPolicy')
                       iam.delete_role(RoleName=role_name)
@@ -324,7 +330,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: CreateCollaborationRoom
-      Runtime: python3.13
+      Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 60
@@ -336,6 +342,7 @@ Resources:
           DEFAULT_LIFETIME_HOURS: !Ref DefaultRoomLifetimeHours
           MAX_CREDENTIAL_DURATION: !Ref MaxCredentialDurationHours
           CLEANUP_FUNCTION_ARN: !GetAtt CleanupRoomFunction.Arn
+          LAMBDA_ROLE_ARN: !GetAtt LambdaExecutionRole.Arn
       Code:
         ZipFile: |
           import json
@@ -394,19 +401,14 @@ Resources:
                   import time
                   iam = boto3.client('iam')
                   account_id = sts.get_caller_identity()['Account']
-                  role_name = f'CollaborationRoom-{room_id[:8]}'
+                  role_name = f'CollaborationRoom-{room_id}'
                   
                   assume_role_policy = {
                       "Version": "2012-10-17",
                       "Statement": [{
                           "Effect": "Allow",
-                          "Principal": {"Service": "lambda.amazonaws.com"},
-                          "Action": "sts:AssumeRole",
-                          "Condition": {
-                              "StringEquals": {
-                                  "aws:SourceAccount": account_id
-                              }
-                          }
+                          "Principal": {"AWS": os.environ['LAMBDA_ROLE_ARN']},
+                          "Action": "sts:AssumeRole"
                       }]
                   }
                   
@@ -436,27 +438,25 @@ Resources:
                       PolicyDocument=json.dumps(room_policy)
                   )
                   
-                  # Wait for role propagation with retry logic
-                  max_retries = 10
-                  for attempt in range(max_retries):
-                      try:
-                          sts.get_caller_identity()
-                          break
-                      except:
-                          if attempt < max_retries - 1:
-                              time.sleep(1)
-                          else:
-                              raise
-                  
-                  # Assume the role (role chaining limited to 1 hour)
+                  # Wait for role propagation and assume role with retry
                   credential_duration = min(lifetime_hours * 3600, int(os.environ['MAX_CREDENTIAL_DURATION']) * 3600, 3600)
                   role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
                   
-                  credentials = sts.assume_role(
-                      RoleArn=role_arn,
-                      RoleSessionName=f'room-session-{room_id[:8]}',
-                      DurationSeconds=credential_duration
-                  )
+                  max_retries = 10
+                  credentials = None
+                  for attempt in range(max_retries):
+                      try:
+                          credentials = sts.assume_role(
+                              RoleArn=role_arn,
+                              RoleSessionName=f'room-session-{room_id}',
+                              DurationSeconds=credential_duration
+                          )
+                          break
+                      except Exception as e:
+                          if attempt < max_retries - 1:
+                              time.sleep(2)
+                          else:
+                              raise
                   
                   # Schedule cleanup
                   rule_name = f'CollaborationRoom-Cleanup-{room_id}'
@@ -573,12 +573,6 @@ Resources:
     Properties:
       RestApiId: !Ref CollaborationAPI
       StageName: prod
-      StageDescription:
-        AccessLogSetting:
-          DestinationArn: !GetAtt ApiLogGroup.Arn
-          Format: '$context.requestId $context.error.message $context.error.messageString'
-        LoggingLevel: INFO
-        MetricsEnabled: true
 
   # CloudWatch Log Group for API Gateway
   ApiLogGroup:
