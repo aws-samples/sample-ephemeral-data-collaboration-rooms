@@ -8,17 +8,17 @@ This project provides a secure, ephemeral data collaboration system using AWS se
 
 ## Architecture
 
-- **S3**: Stores collaboration room data with encryption and versioning
-- **DynamoDB**: Tracks room metadata (table: `CollaborationRoomMetadata`)
-- **Lambda**: Manages room creation (`CreateCollaborationRoom`) and cleanup (`CleanupCollaborationRoom`)
-- **API Gateway**: RESTful API (`CollaborationRoomsAPI`) for room management
-- **EventBridge**: Schedules automatic room cleanup
-- **IAM**: Generates temporary credentials with scoped permissions
+- **Amazon Simple Storage Service (Amazon S3)**: Stores collaboration room data with encryption and versioning
+- **Amazon DynamoDB**: Tracks room metadata (table: `CollaborationRoomMetadata`)
+- **AWS Lambda**: Manages room creation (`CreateCollaborationRoom`) and cleanup (`CleanupCollaborationRoom`)
+- **Amazon API Gateway**: RESTful API (`CollaborationRoomsAPI`) for room management
+- **Amazon EventBridge**: Schedules automatic room cleanup
+- **AWS Identity and Access Management (IAM)**: Generates temporary credentials with scoped permissions
 
 ## Prerequisites
 
 - AWS CLI configured with appropriate credentials
-- AWS account with permissions to create CloudFormation stacks
+- AWS account with permissions to create AWS CloudFormation stacks
 - Bash shell (for deployment scripts)
 
 ## Deployment
@@ -81,7 +81,7 @@ python3 upload-file.py <access_key> <secret_key> <session_token> <file_path>
 
 ## Configuration
 
-Default parameters in CloudFormation template:
+Default parameters in AWS CloudFormation template:
 - `DefaultRoomLifetimeHours`: 24 hours (1-168)
 - `MaxCredentialDurationHours`: 12 hours (1-12)
 
