@@ -1,0 +1,17 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Scan reports
+scan-report.json
+
+# Kiro
+.kiro/
