@@ -151,6 +151,10 @@ Resources:
               - 'kms:Delete*'
               - 'kms:ScheduleKeyDeletion'
               - 'kms:CancelKeyDeletion'
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
             Resource: '*'
           - Sid: Allow DynamoDB
             Effect: Allow
@@ -218,6 +222,10 @@ Resources:
               - 'kms:Delete*'
               - 'kms:ScheduleKeyDeletion'
               - 'kms:CancelKeyDeletion'
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
             Resource: '*'
           - Sid: Allow Lambda
             Effect: Allow
@@ -274,66 +282,77 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: CollaborationRoomManagement
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:GetObject
-                  - s3:DeleteObject
-                  - s3:ListBucket
-                Resource:
-                  - !GetAtt CollaborationBucket.Arn
-                  - !Sub '${CollaborationBucket.Arn}/*'
-              - Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:GetItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:Query
-                  - dynamodb:Scan
-                Resource: !GetAtt RoomMetadataTable.Arn
-              - Effect: Allow
-                Action:
-                  - sts:AssumeRole
-                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/CollaborationRoom-*'
-              - Effect: Allow
-                Action:
-                  - iam:CreateRole
-                  - iam:DeleteRole
-                  - iam:PutRolePolicy
-                  - iam:DeleteRolePolicy
-                  - iam:GetRole
-                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/CollaborationRoom-*'
-              - Effect: Allow
-                Action:
-                  - events:PutRule
-                  - events:PutTargets
-                  - events:DeleteRule
-                  - events:RemoveTargets
-                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/CollaborationRoom-Cleanup-*'
-              - Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:CleanupCollaborationRoom'
-              - Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:Encrypt
-                  - kms:GenerateDataKey
-                  - kms:DescribeKey
-                Resource:
-                  - !GetAtt DynamoDBKmsKey.Arn
-                  - !GetAtt LogsKmsKey.Arn
-                  - !GetAtt LambdaKmsKey.Arn
-              - Effect: Allow
-                Action:
-                  - sqs:SendMessage
-                Resource: !GetAtt LambdaDeadLetterQueue.Arn
+        - !Ref LambdaExecutionPolicy
+
+  # Managed Policy for Lambda Functions
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-LambdaExecutionPolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt CollaborationBucket.Arn
+              - !Sub '${CollaborationBucket.Arn}/*'
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource: !GetAtt RoomMetadataTable.Arn
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/CollaborationRoom-*'
+          - Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRole
+            Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/CollaborationRoom-*'
+          - Effect: Allow
+            Action:
+              - scheduler:CreateSchedule
+              - scheduler:DeleteSchedule
+              - scheduler:GetSchedule
+            Resource: !Sub 'arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/CollaborationRoom-Cleanup-*'
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: !GetAtt SchedulerExecutionRole.Arn
+            Condition:
+              StringEquals:
+                'iam:PassedToService': scheduler.amazonaws.com
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:CleanupCollaborationRoom'
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource:
+              - !GetAtt DynamoDBKmsKey.Arn
+              - !GetAtt LogsKmsKey.Arn
+              - !GetAtt LambdaKmsKey.Arn
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
 
   # Lambda Function: Cleanup Room
   CleanupRoomFunction:
@@ -360,8 +379,8 @@ Resources:
           
           s3 = boto3.client('s3')
           dynamodb = boto3.resource('dynamodb')
-          events = boto3.client('events')
-          
+          scheduler = boto3.client('scheduler')
+
           def lambda_handler(event, context):
               try:
                   room_id = event.get('room_id')
@@ -405,14 +424,16 @@ Resources:
                   except Exception as e:
                       print(f'Error deleting IAM role: {str(e)}')
                   
-                  rule_name = f'CollaborationRoom-Cleanup-{room_id}'
+                  # Delete the one-time cleanup schedule. Schedules created with
+                  # ActionAfterCompletion='DELETE' self-remove after firing; this explicit
+                  # delete covers manual/early cleanup invocations.
+                  schedule_name = f'CollaborationRoom-Cleanup-{room_id}'
                   try:
-                      events.remove_targets(Rule=rule_name, Ids=['1'])
-                      events.delete_rule(Name=rule_name)
-                  except events.exceptions.ResourceNotFoundException:
-                      print(f'EventBridge rule {rule_name} not found, skipping')
+                      scheduler.delete_schedule(Name=schedule_name)
+                  except scheduler.exceptions.ResourceNotFoundException:
+                      print(f'EventBridge schedule {schedule_name} not found, skipping')
                   except Exception as e:
-                      print(f'Error removing EventBridge rule: {str(e)}')
+                      print(f'Error removing EventBridge schedule: {str(e)}')
                   
                   return {
                       'statusCode': 200,
@@ -424,6 +445,39 @@ Resources:
                       'statusCode': 500,
                       'body': json.dumps({'error': 'Internal server error'})
                   }
+
+  # IAM Role assumed by EventBridge Scheduler to invoke the cleanup function
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - !Ref SchedulerExecutionPolicy
+
+  # Managed Policy for EventBridge Scheduler Role
+  SchedulerExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-SchedulerExecutionPolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            # Reference by constructed ARN (function has a fixed name) rather than
+            # !GetAtt to avoid a circular dependency: LambdaExecutionRole -> (PassRole)
+            # SchedulerExecutionRole -> CleanupRoomFunction -> (Role) LambdaExecutionRole.
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:CleanupCollaborationRoom'
 
   # Lambda Function: Create Room
   CreateRoomFunction:
@@ -446,6 +500,7 @@ Resources:
           MAX_CREDENTIAL_DURATION: !Ref MaxCredentialDurationHours
           CLEANUP_FUNCTION_ARN: !GetAtt CleanupRoomFunction.Arn
           LAMBDA_ROLE_ARN: !GetAtt LambdaExecutionRole.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerExecutionRole.Arn
       Code:
         ZipFile: |
           import json
@@ -457,25 +512,69 @@ Resources:
           s3 = boto3.client('s3')
           dynamodb = boto3.resource('dynamodb')
           sts = boto3.client('sts')
-          events = boto3.client('events')
-          
+          scheduler = boto3.client('scheduler')
+
+          # Max session duration configured on the per-room role (seconds). A role may
+          # allow up to 12h, so this is fine as the role's ceiling.
+          MAX_SESSION_DURATION = 43200  # 12 hours
+
+          # Hard ceiling on the DurationSeconds this Lambda can request via AssumeRole.
+          # The Lambda already runs under an assumed-role session, so its AssumeRole call
+          # is "role chaining", which AWS caps at 1 hour REGARDLESS of the role's
+          # MaxSessionDuration. Requesting more fails with a validation error. See:
+          # https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html
+          ROLE_CHAINING_MAX_DURATION = 3600  # 1 hour (AWS-enforced for role chaining)
+
+          MAX_DESCRIPTION_LEN = 1024
+
           def lambda_handler(event, context):
+              room_id = None  # set before any resource is created; used by rollback on failure
               try:
-                  body = json.loads(event['body']) if isinstance(event.get('body'), str) else event
-                  
+                  # event is the API Gateway proxy event (dict with a 'body' string) on the
+                  # public path, or the raw payload on a direct invoke. Extract the request
+                  # body defensively: a non-dict event or unparseable/non-object body is a
+                  # client error, not a 500.
+                  try:
+                      if isinstance(event, dict) and isinstance(event.get('body'), str):
+                          body = json.loads(event['body'])
+                      else:
+                          body = event
+                  except (ValueError, TypeError):
+                      return {'statusCode': 400, 'body': json.dumps({'error': 'Request body must be valid JSON'})}
+                  if not isinstance(body, dict):
+                      return {'statusCode': 400, 'body': json.dumps({'error': 'Request body must be a JSON object'})}
+
                   room_id = str(uuid.uuid4())
+
+                  # Validate requester_email: required, non-empty string. Format validation
+                  # (e.g. RFC-compliant email) is left as a production hardening step; see
+                  # SECURITY.md.
                   requester = body.get('requester_email')
-                  lifetime_hours = body.get('lifetime_hours', int(os.environ['DEFAULT_LIFETIME_HOURS']))
+                  if not isinstance(requester, str) or not requester.strip():
+                      return {'statusCode': 400, 'body': json.dumps({'error': 'requester_email is required and must be a non-empty string'})}
+
+                  # Validate description: optional string, length-capped so the DynamoDB item
+                  # cannot be pushed toward the 400 KB item limit (which would fail put_item
+                  # only after the S3 prefix and IAM role were already created).
                   description = body.get('description', '')
-                  
-                  # Validate lifetime_hours
+                  if not isinstance(description, str):
+                      return {'statusCode': 400, 'body': json.dumps({'error': 'description must be a string'})}
+                  if len(description) > MAX_DESCRIPTION_LEN:
+                      return {'statusCode': 400, 'body': json.dumps({'error': f'description must be at most {MAX_DESCRIPTION_LEN} characters'})}
+
+                  # Validate lifetime_hours: must be an integer within range. bool is a
+                  # subclass of int in Python, so reject it explicitly; also rejects floats,
+                  # strings, and null (which previously fell through to a 500).
                   max_lifetime = int(os.environ['DEFAULT_LIFETIME_HOURS'])
-                  if lifetime_hours > max_lifetime or lifetime_hours < 1:
+                  lifetime_hours = body.get('lifetime_hours', max_lifetime)
+                  if isinstance(lifetime_hours, bool) or not isinstance(lifetime_hours, int):
+                      return {'statusCode': 400, 'body': json.dumps({'error': 'lifetime_hours must be an integer'})}
+                  if lifetime_hours < 1 or lifetime_hours > max_lifetime:
                       return {
                           'statusCode': 400,
                           'body': json.dumps({'error': f'lifetime_hours must be between 1 and {max_lifetime}'})
                       }
-                  
+
                   bucket_name = os.environ['BUCKET_NAME']
                   table_name = os.environ['TABLE_NAME']
                   
@@ -517,21 +616,32 @@ Resources:
                   
                   room_policy = {
                       "Version": "2012-10-17",
-                      "Statement": [{
-                          "Effect": "Allow",
-                          "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
-                          "Resource": [
-                              f"arn:aws:s3:::{bucket_name}/{room_prefix}*",
-                              f"arn:aws:s3:::{bucket_name}"
-                          ]
-                      }]
+                      "Statement": [
+                          {
+                              # Object-level access, scoped to this room's prefix only.
+                              "Effect": "Allow",
+                              "Action": ["s3:GetObject", "s3:PutObject"],
+                              "Resource": f"arn:aws:s3:::{bucket_name}/{room_prefix}*"
+                          },
+                          {
+                              # ListBucket is a bucket-level action; without an s3:prefix
+                              # condition it would let this room enumerate the keys of every
+                              # other room. Restrict listing to this room's prefix.
+                              "Effect": "Allow",
+                              "Action": "s3:ListBucket",
+                              "Resource": f"arn:aws:s3:::{bucket_name}",
+                              "Condition": {
+                                  "StringLike": {"s3:prefix": [f"{room_prefix}*"]}
+                              }
+                          }
+                      ]
                   }
                   
                   # Create IAM role for this room
                   iam.create_role(
                       RoleName=role_name,
                       AssumeRolePolicyDocument=json.dumps(assume_role_policy),
-                      MaxSessionDuration=43200
+                      MaxSessionDuration=MAX_SESSION_DURATION
                   )
                   
                   # Attach inline policy
@@ -541,8 +651,19 @@ Resources:
                       PolicyDocument=json.dumps(room_policy)
                   )
                   
-                  # Wait for role propagation and assume role with retry
-                  credential_duration = min(lifetime_hours * 3600, int(os.environ['MAX_CREDENTIAL_DURATION']) * 3600, 3600)
+                  # Wait for role propagation and assume role with retry.
+                  # credential_duration is the MINIMUM of every applicable upper bound so
+                  # it violates none of them:
+                  #   1. lifetime_hours          - don't let creds outlive the room
+                  #   2. MAX_CREDENTIAL_DURATION  - admin/compliance cap (<=12h)
+                  #   3. ROLE_CHAINING_MAX_DURATION - AWS's hard 1h cap for role chaining
+                  # Bound 3 is the binding one here: because this Lambda's AssumeRole is
+                  # role chaining, anything above 3600s is rejected by STS.
+                  credential_duration = min(
+                      lifetime_hours * 3600,
+                      int(os.environ['MAX_CREDENTIAL_DURATION']) * 3600,
+                      ROLE_CHAINING_MAX_DURATION
+                  )
                   role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
                   
                   max_retries = 10
@@ -561,21 +682,21 @@ Resources:
                           else:
                               raise
                   
-                  # Schedule cleanup
-                  rule_name = f'CollaborationRoom-Cleanup-{room_id}'
-                  events.put_rule(
-                      Name=rule_name,
-                      ScheduleExpression=f'cron({expiration_time.minute} {expiration_time.hour} {expiration_time.day} {expiration_time.month} ? *)',
-                      State='ENABLED'
-                  )
-                  
-                  events.put_targets(
-                      Rule=rule_name,
-                      Targets=[{
-                          'Id': '1',
-                          'Arn': os.environ.get('CLEANUP_FUNCTION_ARN'),
+                  # Schedule one-time cleanup via EventBridge Scheduler. The at() expression
+                  # fires once at expiration (expiration_time is UTC) and the schedule deletes
+                  # itself after running, so per-room schedules do not accumulate.
+                  schedule_name = f'CollaborationRoom-Cleanup-{room_id}'
+                  scheduler.create_schedule(
+                      Name=schedule_name,
+                      ScheduleExpression=expiration_time.strftime('at(%Y-%m-%dT%H:%M:%S)'),
+                      ScheduleExpressionTimezone='UTC',
+                      FlexibleTimeWindow={'Mode': 'OFF'},
+                      ActionAfterCompletion='DELETE',
+                      Target={
+                          'Arn': os.environ['CLEANUP_FUNCTION_ARN'],
+                          'RoleArn': os.environ['SCHEDULER_ROLE_ARN'],
                           'Input': json.dumps({'room_id': room_id})
-                      }]
+                      }
                   )
                   
                   return {
@@ -601,19 +722,161 @@ Resources:
                   }
               except Exception as e:
                   print(f'Error: {str(e)}')
+                  # Compensating rollback: if creation fails partway through (e.g. role
+                  # propagation never succeeds, or scheduling fails), delete whatever was
+                  # already created so we never leak an IAM role / S3 prefix / metadata row
+                  # with no cleanup schedule to reap them. All names derive from room_id,
+                  # which is set before any resource is created; each step is best-effort.
+                  _rollback_partial_room(room_id)
                   return {
                       'statusCode': 500,
                       'body': json.dumps({'error': 'Internal server error'})
                   }
 
-  # Lambda Permission for EventBridge
-  CleanupFunctionEventPermission:
-    Type: AWS::Lambda::Permission
+          def _rollback_partial_room(room_id):
+              if not room_id:
+                  return  # failed before any resource was created; nothing to roll back
+              bucket_name = os.environ['BUCKET_NAME']
+              table_name = os.environ['TABLE_NAME']
+              role_name = f'CollaborationRoom-{room_id}'
+              room_prefix = f'rooms/{room_id}/'
+              # Delete inline policy + role
+              try:
+                  iam = boto3.client('iam')
+                  try:
+                      iam.delete_role_policy(RoleName=role_name, PolicyName='RoomAccessPolicy')
+                  except iam.exceptions.NoSuchEntityException:
+                      pass
+                  try:
+                      iam.delete_role(RoleName=role_name)
+                  except iam.exceptions.NoSuchEntityException:
+                      pass
+              except Exception as e:
+                  print(f'Rollback: error deleting IAM role {role_name}: {str(e)}')
+              # Delete any schedule that was created
+              try:
+                  scheduler.delete_schedule(Name=f'CollaborationRoom-Cleanup-{room_id}')
+              except scheduler.exceptions.ResourceNotFoundException:
+                  pass
+              except Exception as e:
+                  print(f'Rollback: error deleting schedule: {str(e)}')
+              # Delete the S3 prefix marker object
+              try:
+                  s3.delete_object(Bucket=bucket_name, Key=room_prefix)
+              except Exception as e:
+                  print(f'Rollback: error deleting S3 prefix: {str(e)}')
+              # Delete the DynamoDB metadata row
+              try:
+                  dynamodb.Table(table_name).delete_item(Key={'RoomId': room_id})
+              except Exception as e:
+                  print(f'Rollback: error deleting DynamoDB item: {str(e)}')
+
+  # Lambda Function: Refresh Room Credentials
+  # Issues a fresh short-lived credential set for an existing, still-active room by
+  # re-assuming the per-room role (which lives until cleanup). Lets collaborators keep
+  # working across a long room lifetime without a single >1h session (see role chaining).
+  RefreshRoomFunction:
+    Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Ref CleanupRoomFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/CollaborationRoom-Cleanup-*'
+      FunctionName: RefreshCollaborationRoomCredentials
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      KmsKeyArn: !GetAtt LambdaKmsKey.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CollaborationBucket
+          TABLE_NAME: !Ref RoomMetadataTable
+          MAX_CREDENTIAL_DURATION: !Ref MaxCredentialDurationHours
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          sts = boto3.client('sts')
+
+          # This Lambda runs under an assumed-role session, so its AssumeRole call is
+          # "role chaining", hard-capped by AWS at 1 hour regardless of the role's
+          # MaxSessionDuration. Mirrors CreateCollaborationRoom.
+          ROLE_CHAINING_MAX_DURATION = 3600  # 1 hour
+          STS_MIN_DURATION = 900             # 15 min (AssumeRole minimum)
+
+          def lambda_handler(event, context):
+              try:
+                  # room_id comes from the API Gateway path, or directly on a raw invoke.
+                  room_id = None
+                  if isinstance(event.get('pathParameters'), dict):
+                      room_id = event['pathParameters'].get('room_id')
+                  if not room_id:
+                      body = json.loads(event['body']) if isinstance(event.get('body'), str) else event
+                      if isinstance(body, dict):
+                          room_id = body.get('room_id')
+                  if not room_id:
+                      return {'statusCode': 400, 'body': json.dumps({'error': 'room_id required'})}
+
+                  table = dynamodb.Table(os.environ['TABLE_NAME'])
+                  response = table.get_item(Key={'RoomId': room_id})
+                  if 'Item' not in response:
+                      return {'statusCode': 404, 'body': json.dumps({'error': 'Room not found'})}
+
+                  item = response['Item']
+                  if item.get('Status') != 'Active':
+                      return {'statusCode': 403, 'body': json.dumps({'error': 'Room is not active'})}
+
+                  expiration_epoch = int(item['ExpirationTime'])
+                  remaining = expiration_epoch - int(time.time())
+                  if remaining <= 0:
+                      return {'statusCode': 403, 'body': json.dumps({'error': 'Room has expired'})}
+
+                  account_id = sts.get_caller_identity()['Account']
+                  role_arn = f"arn:aws:iam::{account_id}:role/CollaborationRoom-{room_id}"
+
+                  # Bound the new session by every applicable ceiling; never let it
+                  # (nominally) outlive the room. Floor at the STS minimum -- the per-room
+                  # role is deleted at cleanup, which invalidates any overhang anyway.
+                  credential_duration = min(
+                      ROLE_CHAINING_MAX_DURATION,
+                      int(os.environ['MAX_CREDENTIAL_DURATION']) * 3600,
+                      remaining
+                  )
+                  credential_duration = max(credential_duration, STS_MIN_DURATION)
+
+                  credentials = sts.assume_role(
+                      RoleArn=role_arn,
+                      RoleSessionName=f'room-session-{room_id}',
+                      DurationSeconds=credential_duration
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'room_id': room_id,
+                          's3_prefix': item['S3Prefix'],
+                          'bucket_name': os.environ['BUCKET_NAME'],
+                          'expiration_time': datetime.utcfromtimestamp(expiration_epoch).isoformat(),
+                          'credentials': {
+                              'access_key_id': credentials['Credentials']['AccessKeyId'],
+                              'secret_access_key': credentials['Credentials']['SecretAccessKey'],
+                              'session_token': credentials['Credentials']['SessionToken'],
+                              'expiration': credentials['Credentials']['Expiration'].isoformat()
+                          },
+                          'message': 'Store credentials securely. They will not be retrievable later.'
+                      })
+                  }
+              except Exception as e:
+                  print(f'Refresh error: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
 
   # API Gateway Usage Plan
   ApiUsagePlan:
@@ -668,6 +931,46 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CollaborationAPI}/*/*'
 
+  # API Gateway Resource: /rooms/{room_id}
+  RoomIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CollaborationAPI
+      ParentId: !Ref RoomsResource
+      PathPart: '{room_id}'
+
+  # API Gateway Resource: /rooms/{room_id}/credentials
+  RoomCredentialsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CollaborationAPI
+      ParentId: !Ref RoomIdResource
+      PathPart: credentials
+
+  # API Gateway Method: POST /rooms/{room_id}/credentials
+  RefreshCredentialsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CollaborationAPI
+      ResourceId: !Ref RoomCredentialsResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      RequestParameters:
+        method.request.path.room_id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RefreshRoomFunction.Arn}/invocations'
+
+  # Lambda Permission for API Gateway (refresh)
+  RefreshRoomFunctionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RefreshRoomFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CollaborationAPI}/*/*'
+
   # IAM Role for API Gateway CloudWatch Logging (conditional)
   ApiGatewayCloudWatchRole:
     Type: AWS::IAM::Role
@@ -692,10 +995,15 @@ Resources:
       CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
 
   # API Gateway Deployment
-  ApiDeployment:
+  # NOTE: Deployments are point-in-time snapshots. When you add/change methods, give
+  # this resource a new logical ID (e.g. bump the suffix) so CloudFormation creates a
+  # fresh deployment that includes the new routes; otherwise the stage keeps serving
+  # the old snapshot.
+  ApiDeploymentV2:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - CreateRoomMethod
+      - RefreshCredentialsMethod
     Properties:
       RestApiId: !Ref CollaborationAPI
 
@@ -704,7 +1012,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref CollaborationAPI
-      DeploymentId: !Ref ApiDeployment
+      DeploymentId: !Ref ApiDeploymentV2
       StageName: prod
       TracingEnabled: true
       AccessLogSetting:
@@ -803,6 +1111,10 @@ Resources:
               - 'kms:Delete*'
               - 'kms:ScheduleKeyDeletion'
               - 'kms:CancelKeyDeletion'
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
             Resource: '*'
           - Sid: Allow CloudWatch Logs
             Effect: Allow

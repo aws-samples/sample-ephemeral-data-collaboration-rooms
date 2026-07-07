@@ -50,6 +50,49 @@ audit log access logs to create a complete audit trail.
 - S3 buckets use SSE-S3 rather than customer-managed KMS keys
 - API Gateway caching is not enabled (performance optimization, not security)
 
+## Limitations
+
+### IAM role quota and propagation latency
+
+Each collaboration room provisions a dedicated `CollaborationRoom-<room_id>` IAM role with an
+inline `RoomAccessPolicy`. These roles count against the account's IAM roles quota, which defaults
+to **1,000 roles per account**. High room-creation churn can exhaust this quota; for high-volume
+deployments, request a quota increase or move to a shared-role design (for example, a single role
+scoped per request via a session policy, or S3 Access Grants — see below).
+
+Newly created IAM roles are not immediately usable for `sts:AssumeRole` because role creation
+propagates asynchronously across IAM. The create path absorbs this with a **10-attempt retry loop**
+(2-second backoff) around `assume_role`, so callers should expect occasional multi-second latency on
+the first room created after a cold start.
+
+### Credential revocability
+
+STS session credentials issued for a room expire automatically at the end of their duration
+(bounded by `MaxCredentialDurationHours`, default 12 hours). They can also be revoked **before**
+natural expiry if needed:
+
+- Attach an inline deny policy to the per-room role using a token-issue-time condition
+  (`aws:TokenIssueTime` with `DateLessThan`), the `AWSRevokeOlderSessions` pattern, to invalidate
+  already-issued sessions.
+- Delete the per-room role outright, which immediately stops any active session from being used.
+
+The cleanup Lambda deletes the per-room role on expiry, so credentials cannot outlive the room.
+
+### Identity-scoped S3 access alternative
+
+This pattern grants room access via per-room IAM roles plus STS credentials. For deployments where
+the IAM role quota or per-room role management is a concern, **Amazon S3 Access Grants** is an
+alternative: it maps identities (IAM principals or directory identities) to time-bound,
+prefix-scoped S3 permissions without minting a new IAM role per room.
+
+### Automatic cleanup
+
+Room cleanup is scheduled with **Amazon EventBridge Scheduler** using a one-time `at()` schedule
+that fires once at the room's expiration and deletes itself afterward
+(`ActionAfterCompletion='DELETE'`). The cleanup Lambda removes the room's S3 objects, marks the
+DynamoDB metadata as `Deleted`, deletes the per-room IAM role and inline policy, and deletes the
+schedule — so neither IAM roles nor schedules accumulate across room lifecycles.
+
 ## Architecture Security
 
 This solution implements the following security controls:
